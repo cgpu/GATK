@@ -157,13 +157,15 @@ if (params.reads) {
   Channel.fromPath(params.bam)
          .map { file -> tuple(file.baseName, file) }
          .ifEmpty { exit 1, "BAM file not found: ${params.bam}" }
-         .set { bam_bqsr }
+         .into { samtools_sort_bam; bam_bqsr }
 } else {
   exit 1, "Please specify either --reads singleEnd.fastq, --reads_folder pairedReads or --bam myfile.bam"
 }
 
 scattered_intervals_ref = fasta_scatter_intervals.merge(fai_scatter_intervals, dict_scatter_intervals)
 
+
+//ToCheckWithPhil: Added when-to-execute condition inspo from nf-core/ataseq     when: !params.skipMergeReplicates
 process ScatterIntervals {
     tag "$fasta"
     container 'broadinstitute/gatk:latest'
@@ -173,6 +175,8 @@ process ScatterIntervals {
 
     output:
     file("skip_Ns.interval_list") into scattered_intervals
+
+    when: !params.bam 
 
     script:
     """
@@ -245,29 +249,9 @@ split_intervals
         .map { it -> it.trim() }
         .set { interval }
 
-if (!params.bam) {
-  
-  process fastqc {
-    tag "$name"
-    publishDir "${params.outdir}/fastqc", mode: 'copy',
-        saveAs: {filename -> filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename"}
-    container 'flowcraft/fastqc:0.11.7-1'
 
-    input:
-    set val(name), file(reads) from reads_fastqc
-
-    output:
-    file "*_fastqc.{zip,html}" into fastqc_results
-
-    when: !params.skip_multiqc
-
-    script:
-    """
-    fastqc -q $reads
-    """
-  }
-  
-  process gunzip_dbsnp {
+// ToCheck: Pulled this one out of if (!params.bam) conditional
+process gunzip_dbsnp {
     tag "$dbsnp_gz"
 
     input:
@@ -290,9 +274,10 @@ if (!params.bam) {
      cp $dbsnp_idx_gz dbsnp.vcf.idx
      """
    }
-  }
 
+  // ToCheck: Pulled this one out of if (!params.bam) conditional
   process gunzip_golden_indel {
+ 
     tag "$golden_indel_gz"
 
     input:
@@ -317,9 +302,38 @@ if (!params.bam) {
    }
   }
 
-  bwa_index = bwa_index_amb.merge(bwa_index_ann, bwa_index_bwt, bwa_index_pac, bwa_index_sa)
-  bwa = reads_bwa.combine(bwa_index)
+/*ToDo: Replace if with  when: !params.bam , check why this should be executed only when: !params.skip_multiqc
+ToCheck: Can I replace this if conditional with a double criterion when eg.     
+when: !params.skipMergeReplicates && replicates_exist  
+Example from nf-core/ataseq
+*/
+if (!params.bam) {
+  
+  process fastqc {
+    tag "$name"
+    publishDir "${params.outdir}/fastqc", mode: 'copy',
+        saveAs: {filename -> filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename"}
+    container 'flowcraft/fastqc:0.11.7-1'
 
+    input:
+    set val(name), file(reads) from reads_fastqc
+
+    output:
+    file "*_fastqc.{zip,html}" into fastqc_results
+
+    when: !params.skip_multiqc
+
+    script:
+    """
+    fastqc -q $reads
+    """
+    }
+  }
+
+bwa_index = bwa_index_amb.merge(bwa_index_ann, bwa_index_bwt, bwa_index_pac, bwa_index_sa)
+bwa = reads_bwa.combine(bwa_index)
+
+//Added script
 process BWA {
   tag "$reads"
   container 'kathrinklee/bwa:latest'
@@ -330,6 +344,9 @@ process BWA {
   output:
   set val(name), file("${name}.sam") into sam
 
+  when: !params.bam
+
+  script:
   """
   bwa mem -M -R '@RG\\tID:${name}\\tSM:${name}\\tPL:Illumina' $fasta $reads > ${name}.sam
   """
@@ -346,12 +363,39 @@ process BWA_sort {
   output:
   set val(name), file("${name}-sorted.bam") into bam_sort, bam_sort_qc
 
+  when: !params.bam
+
+  script:
   """
   samtools sort -o ${name}-sorted.bam -O BAM $sam
   """
 
 }
 
+// Add sorting to bam files even if provided when params.bam is TRUE
+process samtools_sort_bam {
+  tag "$bam"
+  container 'lifebitai/samtools:latest'
+
+  input:
+  set val(name), file(bam) from samtools_sort_bam
+
+  output:
+  set val(name), file("${name}-sorted.bam") into bam_sort, bam_sort_qc
+
+  when: params.bam
+
+  script:
+  """
+  samtools sort -o ${name}-sorted.bam -O BAM $bam
+  """
+}
+
+
+/* 
+These all now run for all the bam files, no matter how they entered the process (from reads or bam provided by user)
+Q: Why qualimap bamqc run only when the user wants multiqc ? Provide it always?
+*/
 process RunBamQCmapped {
     tag "$bam"
     container 'maxulysse/sarek:latest'
@@ -471,7 +515,7 @@ if (!params.bai){
   bam_bqsr.merge(bai).into { indexed_bam_bqsr; indexed_bam_qc; indexed_bam_structural_variantcaller }
 }
 
-
+// Removed     when: !params.skip_multiqc conditional so that qualimap bampqc runs for everything
 process RunBamQCrecalibrated {
     tag "$bam"
     container 'maxulysse/sarek:latest'
@@ -483,8 +527,6 @@ process RunBamQCrecalibrated {
 
     output:
     file("${name}_recalibrated") into bamQCrecalibratedReport
-
-    when: !params.skip_multiqc
 
     script:
     """
@@ -505,6 +547,8 @@ process RunBamQCrecalibrated {
 haplotypecaller_index = fasta_haplotypecaller.merge(fai_haplotypecaller, dict_haplotypecaller, indexed_bam_bqsr, intervals_file)
 haplotypecaller = interval.combine(haplotypecaller_index)
 
+
+// Updated file extension to be .vcf instead of .vcf
 process HaplotypeCaller {
   tag "$interval"
   container 'broadinstitute/gatk:latest'
@@ -515,8 +559,8 @@ process HaplotypeCaller {
   set val(interval), file(fasta), file(fai), file(dict), val(sample), file(bam_bqsr), file(bai), file(intervals_file) from haplotypecaller
 
   output:
-  file("${sample}.g.vcf") into haplotypecaller_gvcf
-  file("${sample}.g.vcf.idx") into index
+  file("${sample}.vcf") into haplotypecaller_gvcf
+  file("${sample}.vcf.idx") into index
   val(sample) into sample
 
   script:
@@ -525,7 +569,7 @@ process HaplotypeCaller {
   gatk HaplotypeCaller \
     --java-options -Xmx${task.memory.toMega()}M \
     -R $fasta \
-    -O ${sample}.g.vcf \
+    -O ${sample}.vcf \
     -I $bam_bqsr \
     -L $interval \
     -isr INTERSECTION \
@@ -538,18 +582,19 @@ process HaplotypeCaller {
   """
 }
 
+// Merges individual chromosome VCFs due to intervals from intervals 
 process MergeVCFs {
-  tag "${name[0]}.g.vcf"
+  tag "${name[0]}.vcf"
   publishDir "${params.outdir}", mode: 'copy'
   container 'broadinstitute/gatk:latest'
 
   input:
-  file ('*.g.vcf') from haplotypecaller_gvcf.collect()
-  file ('*.g.vcf.idx') from index.collect()
+  file ('*.vcf') from haplotypecaller_gvcf.collect()
+  file ('*.vcf.idx') from index.collect()
   val name from sample.collect()
 
   output:
-  set val("${name[0]}"), file("${name[0]}.g.vcf"), file("${name[0]}.g.vcf.idx") into vcf_bcftools, vcf_variant_eval
+  set val("${name[0]}"), file("${name[0]}.vcf"), file("${name[0]}.vcf.idx") into vcf_bcftools, vcf_variant_eval
 
   script:
   """
@@ -560,7 +605,7 @@ process MergeVCFs {
 
   gatk MergeVcfs \
   --INPUT= input_variant_files.list \
-  --OUTPUT= ${name[0]}.g.vcf
+  --OUTPUT= ${name[0]}.vcf
   """
 }
 
